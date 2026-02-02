@@ -31,7 +31,6 @@ from torchao.testing.model_architectures import ToyTwoLinearModel
 from torchao.testing.utils import TorchAOIntegrationTestCase, skip_if_xpu
 from torchao.utils import (
     get_available_devices,
-    get_current_accelerator_device,
     torch_version_at_least,
 )
 
