@@ -23,6 +23,7 @@
 #endif // TORCHAO_ENABLE_KLEIDI
 #else
 // Fallback implementation for non-ARM architectures (x86, etc.)
+#include <torchao/csrc/cpu/torch_free_kernels/fallback/kleidi/pack.h>
 #include <torchao/csrc/cpu/torch_free_kernels/fallback/linear/channelwise_8bit_activation_groupwise_lowbit_weight.h>
 #endif // TORCHAO_BUILD_CPU_AARCH64
 
@@ -291,7 +292,9 @@ get_linear_config_kleidi(int n_step, int nr, int kr, int sr) {
        &op::pack_activations,
        &kernel_struct::kernel});
 }
+#endif // TORCHAO_ENABLE_KLEIDI
 
+#if defined(TORCHAO_ENABLE_KLEIDI) || !defined(TORCHAO_BUILD_CPU_AARCH64)
 template <int weight_nbit>
 void register_ukernel_config_kleidi(
     UKernelConfigRegistrationTable& table,
@@ -300,12 +303,20 @@ void register_ukernel_config_kleidi(
   if (!cpuinfo_initialize()) {
     throw std::runtime_error("Failed to initialize cpuinfo!");
   }
-  check_format(format, torchao::ops::PackedWeightsType::linear_8bit_act_xbit_weight_kleidi_ai, weight_nbit);
-  namespace op = torchao::kernels::cpu::aarch64::kleidi::
+  check_format(
+      format,
+      torchao::ops::PackedWeightsType::linear_8bit_act_xbit_weight_kleidi_ai,
+      weight_nbit);
+#if defined(TORCHAO_ENABLE_KLEIDI)
+  namespace packing = torchao::kernels::cpu::aarch64::kleidi::
       kai_matmul_clamp_f32_qai8dxp_qsi4c32p;
+#else
+  namespace packing = torchao::kernels::cpu::fallback::kleidi::
+      kai_matmul_clamp_f32_qai8dxp_qsi4c32p;
+#endif
 
   auto uk = UKernelConfig::make(
-      /*preferred_alignment*/ op::get_preferred_alignement(),
+      /*preferred_alignment*/ packing::get_preferred_alignement(),
       /*n_step*/ format.nr,
       format.nr,
       format.kr,
@@ -313,10 +324,14 @@ void register_ukernel_config_kleidi(
       format.weight_nbit,
       format.has_weight_zeros,
       format.has_bias,
-      &op::packed_weights_size,
-      &op::packed_weights_offset,
-      &op::pack_weights,
+      &packing::packed_weights_size,
+      &packing::packed_weights_offset,
+      &packing::pack_weights,
       {} /*linear_configs*/);
+
+#if defined(TORCHAO_ENABLE_KLEIDI)
+  namespace op = torchao::kernels::cpu::aarch64::kleidi::
+      kai_matmul_clamp_f32_qai8dxp_qsi4c32p;
 
   if (format.nr == 8 && format.kr == 16 && format.sr == 2) {
     uk.n_step = 8;
@@ -374,8 +389,31 @@ void register_ukernel_config_kleidi(
     }
 #endif // TORCHAO_ENABLE_ARM_NEON_DOT
   }
-}
+
+#else
+  if (format.nr == 8 && format.kr == 8 && format.sr == 2) {
+    namespace kernel = torchao::kernels::cpu::fallback::linear::
+        channelwise_8bit_activation_groupwise_lowbit_weight;
+    constexpr int mr = 1;
+    constexpr int kr = 8;
+    constexpr int sr = 2;
+    log_registration(format, "kleidiai: fallback (pack weights only)");
+    uk.linear_configs[0] = UKernelConfig::linear_config_type(
+        {/*m_step=*/1,
+         mr,
+         &kernel::packed_activations_size,
+         &kernel::packed_activations_offset,
+         &kernel::pack_activations<mr, kr, sr>,
+         &kernel::kernel_1x8x16_f32_fallback<
+             weight_nbit,
+             /*has_weight_zeros=*/false,
+             /*has_lut=*/false>});
+    table.register_ukernel_config(format, uarch, std::move(uk));
+    return;
+  }
 #endif // TORCHAO_ENABLE_KLEIDI
+}
+#endif // TORCHAO_ENABLE_KLEIDI || !TORCHAO_BUILD_CPU_AARCH64
 
 template <int weight_nbit>
 void register_ukernel_config(
@@ -388,10 +426,11 @@ void register_ukernel_config(
       register_ukernel_config_universal<weight_nbit>(table, format, uarch);
       break;
     }
-    case torchao::ops::PackedWeightsType::linear_8bit_act_xbit_weight_kleidi_ai: {
-#ifdef TORCHAO_ENABLE_KLEIDI
+    case torchao::ops::PackedWeightsType::
+        linear_8bit_act_xbit_weight_kleidi_ai: {
+#if defined(TORCHAO_ENABLE_KLEIDI) || !defined(TORCHAO_BUILD_CPU_AARCH64)
       register_ukernel_config_kleidi<weight_nbit>(table, format, uarch);
-#endif // TORCHAO_ENABLE_KLEIDI
+#endif // TORCHAO_ENABLE_KLEIDI || !TORCHAO_BUILD_CPU_AARCH64
       break;
     }
     case torchao::ops::PackedWeightsType::linear_8bit_act_xbit_weight_lut: {
@@ -449,13 +488,20 @@ PackedWeightsFormat select_packed_weights_format(
     std::optional<std::string> target,
     bool has_weight_zeros,
     bool has_bias) {
-// Select KleidiAI format
+  // Select KleidiAI format. On non-Arm hosts it is only selected explicitly,
+  // since those hosts can pack weights for an Arm target but cannot execute
+  // the resulting linear operator.
+#if defined(TORCHAO_ENABLE_KLEIDI) || !defined(TORCHAO_BUILD_CPU_AARCH64)
+  bool select_kleidi = target && *target == "kleidiai";
 #if defined(TORCHAO_ENABLE_KLEIDI)
-  if (!target || *target == "kleidiai") {
+  select_kleidi |= !target;
+#endif
+  if (select_kleidi) {
     if (weight_nbit == 4 && (!has_weight_zeros)) {
 #if defined(TORCHAO_ENABLE_ARM_I8MM)
       return PackedWeightsFormat(
-          torchao::ops::PackedWeightsType::linear_8bit_act_xbit_weight_kleidi_ai,
+          torchao::ops::PackedWeightsType::
+              linear_8bit_act_xbit_weight_kleidi_ai,
           weight_nbit,
           has_weight_zeros,
           has_bias,
@@ -464,7 +510,21 @@ PackedWeightsFormat select_packed_weights_format(
           /*sr*/ 2);
 #elif defined(TORCHAO_ENABLE_ARM_NEON_DOT)
       return PackedWeightsFormat(
-          torchao::ops::PackedWeightsType::linear_8bit_act_xbit_weight_kleidi_ai,
+          torchao::ops::PackedWeightsType::
+              linear_8bit_act_xbit_weight_kleidi_ai,
+          weight_nbit,
+          has_weight_zeros,
+          has_bias,
+          /*nr*/ 8,
+          /*kr*/ 8,
+          /*sr*/ 2);
+#elif !defined(TORCHAO_BUILD_CPU_AARCH64)
+      // Use the baseline NEON dot-product layout for cross-architecture AOT
+      // packing. It can execute on a wider set of Arm CPUs than the I8MM
+      // layout and does not require probing the deployment target here.
+      return PackedWeightsFormat(
+          torchao::ops::PackedWeightsType::
+              linear_8bit_act_xbit_weight_kleidi_ai,
           weight_nbit,
           has_weight_zeros,
           has_bias,
@@ -474,7 +534,7 @@ PackedWeightsFormat select_packed_weights_format(
 #endif
     }
   }
-#endif // defined(TORCHAO_ENABLE_KLEIDI)
+#endif // TORCHAO_ENABLE_KLEIDI || !TORCHAO_BUILD_CPU_AARCH64
 
   // Select universal format
   if (!target || *target == "universal") {

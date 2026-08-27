@@ -17,5 +17,14 @@ target_link_libraries(
     GTest::gtest_main
 )
 
+add_executable(${TEST_TARGET_PREFIX}test_kleidi_packing test_kleidi_packing.cpp)
+target_link_libraries(
+    ${TEST_TARGET_PREFIX}test_kleidi_packing
+    PRIVATE
+    GTest::gtest_main
+    cpuinfo
+)
+
 include(GoogleTest)
 gtest_discover_tests(${TEST_TARGET_PREFIX}test_bitpacking)
+gtest_discover_tests(${TEST_TARGET_PREFIX}test_kleidi_packing)
